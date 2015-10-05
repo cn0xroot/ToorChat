@@ -1,8 +1,11 @@
-#!/usr/bin/env ipython
+#!/usr/bin/env ipython -i --no-banner
 from chipcon_nic import *
+import rflib.bits as rfbits
 
 RFCAT_START_SPECAN  = 0x40
 RFCAT_STOP_SPECAN   = 0x41
+
+MAX_FREQ = 936e6
 
 class RfCat(FHSSNIC):
     def RFdump(self, msg="Receiving", maxnum=100, timeoutms=1000):
@@ -20,10 +23,10 @@ class RfCat(FHSSNIC):
         self.RFdump("Clearing")
         self.lowball(lowball)
         self.setMdmDRate(drate)
-        print "Scanning range: "
+        print "Scanning range:  "
         while not keystop():
             try:
-                print
+                print "(press Enter to quit)"
                 for freq in xrange(int(basefreq), int(basefreq+(inc*count)), int(inc)):
                     print "Scanning for frequency %d..." % freq
                     self.setFreq(freq)
@@ -40,14 +43,13 @@ class RfCat(FHSSNIC):
         freq, delta = self._doSpecAn(basefreq, inc, count)
 
         import rflib.ccspecan as rfspecan
-        if not hasattr(self, "_qt_app") or self._qt_app is None:
-            self._qt_app = rfspecan.QtGui.QApplication([])
+        rfspecan.ensureQapp()
 
         fhigh = freq + (delta*(count+1))
 
         window = rfspecan.Window(self, freq, fhigh, delta, 0)
         window.show()
-        self._qt_app.exec_()
+        rfspecan._qt_app.exec_()
         
     def _doSpecAn(self, basefreq, inc, count):
         '''
@@ -55,6 +57,9 @@ class RfCat(FHSSNIC):
         '''
         if count>255:
             raise Exception("sorry, only 255 samples per pass... (count)")
+        if (count * inc) + basefreq > MAX_FREQ:
+            raise Exception("Sorry, %1.3f + (%1.3f * %1.3f) is higher than %1.3f" %
+                    (basefreq, count, inc))
         self.getRadioConfig()
         self._specan_backup_radiocfg = self.radiocfg
 
@@ -79,7 +84,9 @@ class RfCat(FHSSNIC):
     def rf_configure(*args, **k2args):
         pass
 
-    def rf_redirection(self, fdtup):
+    def rf_redirection(self, fdtup, use_rawinput=False, printable=False):
+        buf = ''
+
         if len(fdtup)>1:
             fd0i, fd0o = fdtup 
         else:
@@ -90,30 +97,82 @@ class RfCat(FHSSNIC):
         if hasattr(fd0i, 'recv'):
             fdsock = True
 
-        while True:
-            x,y,z = select.select([fd0i ], [], [], .1)
-            #if self._pause:
-            #    continue
+        try:
+            while True:
+                #if self._pause:
+                #    continue
 
-            if fd0i in x:
-                if fdsock:
-                    data = fd0i.recv(self.max_packet_size)
-                else:
-                    data = fd0i.read(self.max_packet_size)
+                try:
+                    x,y,z = select.select([fd0i ], [], [], .1)
+                    if fd0i in x:
+                        # FIXME: make this aware of VLEN/FLEN and the proper length
+                        if fdsock:
+                            data = fd0i.recv(self.max_packet_size)
+                        else:
+                            data = fd0i.read(self.max_packet_size)
 
-                if not len(data):       # terminated socket
-                    break
+                        if not len(data):       # terminated socket
+                            break
 
-                self.RFxmit(data)
+                        buf += data
+                        pktlen, vlen = self.getPktLEN()
+                        if vlen:
+                            pktlen = ord(buf[0])
 
-            try:
-                data = self.RFrecv(0)
-                if fdsock:
-                    fd0o.sendall(data)
-                else:
-                    fd0o.write(data)
-            except ChipconUsbTimeoutException:
-                pass
+                        #FIXME: probably want to take in a length struct here and then only send when we have that many bytes...
+                        data = buf[:pktlen]
+                        if use_rawinput:
+                            data = eval('"%s"'%data)
+
+                        if len(buf) >= pktlen:
+                            self.RFxmit(data)
+
+                except ChipconUsbTimeoutException:
+                    pass
+
+                try:
+                    data, time = self.RFrecv(1)
+
+                    if printable:
+                        data = "\n"+str(time)+": "+repr(data)
+                    else:
+                        data = struct.pack("<L", time) + struct.pack("<H", len(data)) + data
+
+                    if fdsock:
+                        fd0o.sendall(data)
+                    else:
+                        fd0o.write(data)
+
+                except ChipconUsbTimeoutException:
+                    pass
+
+                #special handling of specan dumps...  somewhat set in solid jello
+                try:
+                    data, time = self.recv(APP_SPECAN, 1, 1)
+                    data = struct.pack("<L", time) + struct.pack("<H", len(data)) + data
+                    if fdsock:
+                        fd0o.sendall(data)
+                    else:
+                        fd0o.write(data)
+
+                except ChipconUsbTimeoutException:
+                    #print "this is a valid exception, run along... %x"% APP_SPECAN
+                    pass
+
+        except KeyboardInterrupt:
+            self.setModeIDLE()
+
+class InverseCat(RfCat):
+    def setMdmSyncWord(self, word, radiocfg=None):
+        FHSSNIC.setMdmSyncWord(self, word ^ 0xffff, radiocfg)
+
+    def RFrecv(self, timeout=1000):
+        global data
+        data,timestamp = RfCat.RFrecv(self, timeout)
+        return rfbits.invertBits(data),timestamp
+
+    def RFxmit(self, data):
+        return RfCat.RFxmit(self, rfbits.invertBits(data) )
 
 def cleanupInteractiveAtExit():
     try:
@@ -143,16 +202,24 @@ def interactive(idx=0, DongleClass=RfCat, intro=''):
 
     except ImportError, e:
         try:
-            from IPython.frontend.terminal.interactiveshell import TerminalInteractiveShell
+            from IPython.terminal.interactiveshell import TerminalInteractiveShell
             ipsh = TerminalInteractiveShell()
             ipsh.user_global_ns.update(gbls)
             ipsh.user_global_ns.update(lcls)
             ipsh.autocall = 2       # don't require parenthesis around *everything*.  be smart!
             ipsh.mainloop(intro)
         except ImportError, e:
-            print e
-            shell = code.InteractiveConsole(gbls)
-            shell.interact(intro)
+            try:
+                from IPython.frontend.terminal.interactiveshell import TerminalInteractiveShell
+                ipsh = TerminalInteractiveShell()
+                ipsh.user_global_ns.update(gbls)
+                ipsh.user_global_ns.update(lcls)
+                ipsh.autocall = 2       # don't require parenthesis around *everything*.  be smart!
+                ipsh.mainloop(intro)
+            except ImportError, e:
+                print e
+                shell = code.InteractiveConsole(gbls)
+                shell.interact(intro)
 
 
 if __name__ == "__main__":

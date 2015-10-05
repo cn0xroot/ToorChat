@@ -1,5 +1,76 @@
 import struct
 
+fmtsLSB = [None, "B", "<H", "<I", "<I", "<Q", "<Q", "<Q", "<Q"]
+fmtsMSB = [None, "B", ">H", ">I", ">I", ">Q", ">Q", ">Q", ">Q"]
+sizes = [ 0, 1, 2, 4, 4, 8, 8, 8, 8]
+masks = [ (1<<(8*i))-1 for i in xrange(9) ]
+
+def wtfo(string):
+    outstr = []
+    bitlen = len(outstr) * 8
+    for x in range(8):
+        outstr.append(shiftString(string, x))
+
+    string = strBitReverse(string)
+    for x in range(8):
+        outstr.append(shiftString(string, x))
+
+    return outstr
+
+def strBitReverse(string):
+    # FIXME: this is really dependent upon python's number system.  large strings will not convert well.  
+    # FIXME: break up array of 8-bit numbers and bit-swap in the array
+    num = 0
+    bits = len(string)*8
+    # convert to MSB number
+    for x in range(len(string)):
+        ch = string[x]
+        #num |= (ord(ch)<<(8*x))        # this is LSB
+        num <<= 8
+        num |= ord(ch)
+
+    print (hex(num))
+    rnum = bitReverse(num, bits)
+    print (hex(rnum))
+
+    # convert back from MSB number to string
+    out = []
+    for x in range(len(string)):
+        out.append(chr(rnum&0xff))
+        rnum >>= 8
+    out.reverse()
+    print(''.join(out).encode('hex'))
+    return ''.join(out)
+
+def strXorMSB(string, xorval, size):
+    '''
+    lsb
+    pads end of string with 00
+    '''
+    out = []
+    strlen = len(string)
+    string += "\x00" * sizes[size]
+
+    for idx in range(0, strlen, size):
+        tempstr = string[idx:idx+sizes[size]]
+        temp, = struct.unpack( fmtsMSB[size], tempstr )
+        temp ^= xorval
+        temp &= masks[size]
+        tempstr = struct.pack( fmtsMSB[size], temp )[-size:]
+        out.append(tempstr)
+    return ''.join(out)
+
+        
+        
+
+def bitReverse(num, bitcnt):
+    newnum = 0
+    for idx in range(bitcnt):
+        newnum <<= 1
+        newnum |= num&1
+        num    >>= 1
+    return newnum
+
 def shiftString(string, bits):
     carry = 0
     news = []
@@ -10,15 +81,66 @@ def shiftString(string, bits):
     news.append("%c"%newc)
     return "".join(news)
 
-def findDword(byts, inverted=False):
+def getNextByte_feedbackRegister7bitsMSB():
+    '''
+    this returns a byte of a 7-bit feedback register stemming off bits 4 and 7
+    the register is 7 bits long, but we return a more usable 8bits (ie. 
+    '''
+    global fbRegister
+
+    retval = 0
+    for x in range(8):      #MSB, 
+        retval <<= 1
+        retval |= (fbRegister >> 6)         # start with bit 7
+        nb = ( ( fbRegister>>3) ^ (fbRegister>>6)) &1 
+        fbRegister = ( ( fbRegister << 1 )   |   nb ) & 0x7f # do shifting
+        #print "retval: %x  fbRegister: %x  bit7: %x  nb: %x" % (retval, fbRegister, (fbRegister>>6), nb)
+
+    return retval
+
+def getNextByte_feedbackRegister7bitsLSB():
+    '''
+    this returns a byte of a 7-bit feedback register stemming off bits 4 and 7
+    the register is 7 bits long, but we return a more usable 8bits (ie. 
+    '''
+    global fbRegister
+
+    retval = 0
+    for x in range(8):      #MSB, 
+        retval >>= 1
+        retval |= ((fbRegister << 1)&0x80)         # start with bit 7
+
+        nb = ( ( fbRegister>>3) ^ (fbRegister>>6)) &1 
+        fbRegister = ( ( fbRegister << 1 )   |   nb ) & 0x7f # do shifting
+        #print "retval: %x  fbRegister: %x  bit7: %x  nb: %x" % (retval, fbRegister, (fbRegister>>6), nb)
+
+    return retval
+
+
+def whitenData(data, seed=0xffff, getNextByte=getNextByte_feedbackRegister7bitsMSB):
+    global fbRegister
+    fbRegister = seed
+
+    carry = 0
+    news = []
+    for x in xrange(len(data)-1):
+        newc = ((ord(data[x]) ^ getNextByte() ) & 0xff)
+        news.append("%c"%newc)
+    return "".join(news)
+
+def findSyncWord(byts, sensitivity=4, minpreamble=2): 
+        '''
+        seek SyncWords from a raw bitstream.  
+        assumes we capture at least two (more likely 3 or more) preamble bytes
+        '''
         possDwords = []
         # find the preamble (if any)
-        while True:
+        while True:         # keep searching through string until we don't find any more preamble bits to pick on
             sbyts = byts
-            pidx = byts.find("\xaa\xaa")
+            pidx = byts.find("\xaa"*minpreamble)
             if pidx == -1:
-                pidx = byts.find("\x55\x55")
-                byts = shiftString(byts,1)
+                pidx = byts.find("\x55"*minpreamble)
+                byts = shiftString(byts, 1)
 
             if pidx == -1:
                 return possDwords
@@ -57,7 +179,8 @@ def findDword(byts, inverted=False):
                 #    bits1 >>= 2
                 #print "bits: %x" % (bits1)
                 
-                for frontbits in xrange((0,1)[inverted], 17, 2):
+                bitcount = min( 2 * sensitivity, 17 ) 
+                for frontbits in xrange( bitcount ):            # with so many bit-inverted systems, let's not assume we know anything about the bit-arrangement.  \x55\x55 could be a perfectly reasonable preamble.
                     poss = (bits1 >> frontbits) & 0xffff
                     if not poss in possDwords:
                         possDwords.append(poss)
@@ -65,7 +188,7 @@ def findDword(byts, inverted=False):
         
         return possDwords
 
-def findDwordDoubled(byts):
+def findSyncWordDoubled(byts):
         possDwords = []
         # find the preamble (if any)
         bitoff = 0
@@ -344,4 +467,30 @@ def reprBitArray(bitAry, width=194):
     mids = "".join(mid)
     bots = "".join(bot)
     return "\n".join([tops, mids, bots])
+
+def invertBits(data):
+    output = []
+    ldata = len(data)
+    off = 0
+
+    if ldata&1:
+        output.append( chr( ord( data[0] ) ^ 0xff) )
+        off = 1
+
+    if ldata&2:
+        output.append( struct.pack( "<H", struct.unpack( "<H", data[off:off+2] )[0] ^ 0xffff) )
+        off += 2
+
+    #method 1
+    #for idx in xrange( off, ldata, 4):
+    #    output.append( struct.pack( "<I", struct.unpack( "<I", data[idx:idx+4] )[0] & 0xffff) )
+
+    #method2
+    count = ldata / 4
+    #print ldata, count
+    numlist = struct.unpack( "<%dI" % count, data[off:] )
+    modlist = [ struct.pack("<L", (x^0xffffffff) ) for x in numlist ]
+    output.extend(modlist)
+
+    return ''.join(output)
 
